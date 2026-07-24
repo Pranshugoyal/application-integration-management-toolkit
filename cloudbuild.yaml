@@ -106,14 +106,19 @@ steps:
       DIGEST=$$(gcloud artifacts docker images describe ${_DEV_IMAGE}:${TAG_NAME} \
         --format='value(image_summary.digest)')
       echo "Promoting $$DIGEST from ${_DEV_REPO} to ${_STAG_REPO}..."
-      curl -s -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -X POST \
-        "https://artifactregistry.googleapis.com/v1/projects/${PROJECT_ID}/locations/us/repositories/${_DEV_REPO}:promoteArtifact" \
+      # Per go/moss-onboarding-cap1: the DESTINATION repo is the resource in the URL
+      # (:promoteArtifact); the body carries source_repository + source_version +
+      # attachment_behavior. There is NO target_repository field.
+      HTTP=$$(curl -s -o /workspace/promote_stg.json -w "%{http_code}" \
+        -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -X POST \
+        "https://artifactregistry.googleapis.com/v1/projects/${PROJECT_ID}/locations/us/repositories/${_STAG_REPO}:promoteArtifact" \
         -d "{
           \"source_repository\": \"projects/${PROJECT_ID}/locations/us/repositories/${_DEV_REPO}\",
           \"source_version\": \"projects/${PROJECT_ID}/locations/us/repositories/${_DEV_REPO}/packages/integrationcli/versions/$$DIGEST\",
-          \"target_repository\": \"projects/${PROJECT_ID}/locations/us/repositories/${_STAG_REPO}\",
           \"attachment_behavior\": \"INCLUDE\"
-        }"
+        }")
+      cat /workspace/promote_stg.json
+      if [ "$$HTTP" != "200" ]; then echo "ERROR: promote dev->staging failed (HTTP $$HTTP)"; exit 1; fi
 
 # 4. EXIT GATE: wait for AutoVM to attach a Vulnerability Attestation (VSA) in STAGING,
 #    then promote STAGING -> PROD (images). If no VSA within the window, fail (no PROD push).
@@ -147,15 +152,18 @@ steps:
         exit 1
       fi
       echo "Promoting $$DIGEST from ${_STAG_REPO} to ${_PROD_REPO}..."
-      # PUBLIC_BCID_VSA_ONLY: only the public BCID/VSA attestations follow to the public repo.
-      curl -s -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -X POST \
-        "https://artifactregistry.googleapis.com/v1/projects/${PROJECT_ID}/locations/us/repositories/${_STAG_REPO}:promoteArtifact" \
+      # Destination (PROD) repo goes in the URL. PUBLIC_BCID_VSA_ONLY keeps internal
+      # staging attestations out of the public repo (only the VSA follows).
+      HTTP=$$(curl -s -o /workspace/promote_prod.json -w "%{http_code}" \
+        -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -X POST \
+        "https://artifactregistry.googleapis.com/v1/projects/${PROJECT_ID}/locations/us/repositories/${_PROD_REPO}:promoteArtifact" \
         -d "{
           \"source_repository\": \"projects/${PROJECT_ID}/locations/us/repositories/${_STAG_REPO}\",
           \"source_version\": \"projects/${PROJECT_ID}/locations/us/repositories/${_STAG_REPO}/packages/integrationcli/versions/$$DIGEST\",
-          \"target_repository\": \"projects/${PROJECT_ID}/locations/us/repositories/${_PROD_REPO}\",
           \"attachment_behavior\": \"PUBLIC_BCID_VSA_ONLY\"
-        }"
+        }")
+      cat /workspace/promote_prod.json
+      if [ "$$HTTP" != "200" ]; then echo "ERROR: promote staging->prod failed (HTTP $$HTTP)"; exit 1; fi
 
 # 5. Tag the promoted digest in PROD as :<version> and :latest. Promotion is by digest,
 #    so the human-facing tags customers pull are (re)applied here; the deprecation step
