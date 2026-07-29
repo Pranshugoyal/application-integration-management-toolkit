@@ -178,7 +178,11 @@ steps:
         --format='value(image_summary.digest)')
       gcloud artifacts docker tags add "${_PROD_IMAGE}@$$DIGEST" "${_PROD_IMAGE}:${TAG_NAME}" --quiet
       gcloud artifacts docker tags add "${_PROD_IMAGE}@$$DIGEST" "${_PROD_IMAGE}:latest" --quiet
-      echo "Tagged PROD $$DIGEST as ${TAG_NAME} and latest."
+      # MOSS Cap-2 (activate public image scanning, go/autovm-scanner-activation#public):
+      # mark the new ACTIVE release with a public-image-<version> lifecycle tag so
+      # the scanner enrolls it as an active public image.
+      gcloud artifacts docker tags add "${_PROD_IMAGE}@$$DIGEST" "${_PROD_IMAGE}:public-image-${TAG_NAME}" --quiet
+      echo "Tagged PROD $$DIGEST as ${TAG_NAME}, latest, and public-image-${TAG_NAME}."
 
 # 6. Retire the PREVIOUS PROD release so the public image scanner (go/publico) treats the
 #    superseded digest as remediated and stops filing vulnerability bugs against it.
@@ -205,6 +209,18 @@ steps:
       gcloud artifacts docker tags add \
         "${_PROD_IMAGE}@$$PREV_DIGEST" \
         "${_PROD_IMAGE}:${_LIFECYCLE_TAG_PREFIX}$$SHA" --quiet
+      # Remove the superseded release's ACTIVE marker(s) so a retired digest is not
+      # tagged both public-image-* (active) and deprecated-public-image-* (retired).
+      PREV_TAGS=$$(gcloud artifacts docker images list "${_PROD_IMAGE}" --include-tags \
+        --filter="version:$$PREV_DIGEST" --format='value(tags)' 2>/dev/null | tr ',' '\n')
+      for t in $$PREV_TAGS; do
+        case "$$t" in
+          public-image-*)
+            echo "Removing active marker $$t from superseded release"
+            gcloud artifacts docker tags delete "${_PROD_IMAGE}:$$t" --quiet || true
+            ;;
+        esac
+      done
 
 availableSecrets:
   secretManager:
