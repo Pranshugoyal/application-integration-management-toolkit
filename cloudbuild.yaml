@@ -164,6 +164,21 @@ steps:
         }")
       cat /workspace/promote_prod.json
       if [ "$$HTTP" != "200" ]; then echo "ERROR: promote staging->prod failed (HTTP $$HTTP)"; exit 1; fi
+      # promoteArtifact is asynchronous: HTTP 200 only means the copy was accepted.
+      # Wait for the promoted digest to actually materialize in PROD before the
+      # downstream tag_prod step keys off it (otherwise tag_prod can race the copy).
+      echo "Waiting for $$DIGEST to land in ${_PROD_REPO}..."
+      LANDED=0
+      for i in $$(seq 1 20); do
+        if gcloud artifacts docker images describe "${_PROD_IMAGE}@$$DIGEST" \
+             --format='value(image_summary.digest)' >/dev/null 2>&1; then
+          LANDED=1; echo "Promoted digest present in ${_PROD_REPO}."; break
+        fi
+        echo "Not in ${_PROD_REPO} yet; waiting 15s... ($$i/20)"; sleep 15
+      done
+      if [ "$$LANDED" != "1" ]; then
+        echo "ERROR: promoted digest never appeared in ${_PROD_REPO} after promotion."; exit 1
+      fi
 
 # 5. Tag the promoted digest in PROD as :<version> and :latest. Promotion is by digest,
 #    so the human-facing tags customers pull are (re)applied here; the deprecation step
@@ -211,13 +226,22 @@ steps:
         "${_PROD_IMAGE}:${_LIFECYCLE_TAG_PREFIX}$$SHA" --quiet
       # Remove the superseded release's ACTIVE marker(s) so a retired digest is not
       # tagged both public-image-* (active) and deprecated-public-image-* (retired).
+      # Guard each delete by re-resolving the tag back to PREV_DIGEST so we never
+      # remove the NEW release's public-image-* marker even if the listing is
+      # over-broad (a stale/broad list must not break Cap-2 scanner enrollment).
       PREV_TAGS=$$(gcloud artifacts docker images list "${_PROD_IMAGE}" --include-tags \
         --filter="version:$$PREV_DIGEST" --format='value(tags)' 2>/dev/null | tr ',' '\n')
       for t in $$PREV_TAGS; do
         case "$$t" in
           public-image-*)
-            echo "Removing active marker $$t from superseded release"
-            gcloud artifacts docker tags delete "${_PROD_IMAGE}:$$t" --quiet || true
+            T_DIGEST=$$(gcloud artifacts docker images describe "${_PROD_IMAGE}:$$t" \
+              --format='value(image_summary.digest)' 2>/dev/null || true)
+            if [ "$$T_DIGEST" = "$$PREV_DIGEST" ]; then
+              echo "Removing active marker $$t from superseded release"
+              gcloud artifacts docker tags delete "${_PROD_IMAGE}:$$t" --quiet || true
+            else
+              echo "Skipping $$t (resolves to $$T_DIGEST, not the superseded digest)"
+            fi
             ;;
         esac
       done
@@ -249,4 +273,4 @@ options:
   dynamic_substitutions: true
   requestedVerifyOption: VERIFIED
 
-timeout: 1800s
+timeout: 3600s
