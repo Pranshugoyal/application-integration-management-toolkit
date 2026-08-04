@@ -87,13 +87,23 @@ steps:
       /tmp/cosign sign --key=/tmp/cosign.key --yes ${_DEV_IMAGE}:${TAG_NAME}
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   id: export_sbom
-  entrypoint: gcloud
+  entrypoint: 'bash'
   args:
-    - artifacts
-    - sbom
-    - export
-    - --uri=${_DEV_IMAGE}:${TAG_NAME}
-    - --project=${PROJECT_ID}
+    - -c
+    - |
+      # The vulnerability scan starts asynchronously when the image is pushed;
+      # `sbom export` fails with FAILED_PRECONDITION ("discovery occurrence has
+      # status SCANNING") until that scan finishes. Retry until it succeeds.
+      for i in $$(seq 1 20); do
+        if gcloud artifacts sbom export --uri=${_DEV_IMAGE}:${TAG_NAME} --project=${PROJECT_ID}; then
+          echo "SBOM exported."
+          exit 0
+        fi
+        echo "SBOM export not ready yet (scan still in progress?); waiting 30s... ($$i/20)"
+        sleep 30
+      done
+      echo "ERROR: SBOM export did not succeed within the wait window."
+      exit 1
 
 # 3. Promote DEV -> STAGING (image + attachments) to await vulnerability scanning.
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
