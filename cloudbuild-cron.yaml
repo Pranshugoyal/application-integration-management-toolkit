@@ -1,0 +1,52 @@
+# MOSS Capability-1, Step 4: scheduled "freshness" rebuild for the public integrationcli image.
+#
+# Fired ~every 3 weeks by Cloud Scheduler -> Pub/Sub -> a Cloud Build trigger that runs THIS
+# config. It pushes a git tag so the existing us-west1 tag trigger rebuilds, rescans, and
+# republishes the container image, resetting the BCID `artifact_age { build { max_days: 30 } }`
+# clock even when there are no code changes.
+#
+# Suppressing binaries/docs on cadence rebuilds:
+#   The tag is "<latest-release>-moss.<timestamp>" (e.g. v0.88.3-moss.20260810120000).
+#   The GoReleaser ("Binary Release") and gen-docs GitHub Actions only fire on strict
+#   `v[0-9].[0-9]+.[0-9]` tags, so the "-moss.*" suffix makes them SKIP a cadence rebuild --
+#   no binaries release, no docs (and no gen-docs failure spam). The container Cloud Build
+#   trigger (which matches `tag: .*`) still fires, so the image is refreshed. This needs NO
+#   changes to the release workflows.
+#
+# Auth: pushes with a Classic PAT stored in Secret Manager (secret `github-tag-pusher-token`);
+#   the Cloud Build service account must have Secret Manager Secret Accessor on it.
+
+steps:
+  - name: 'gcr.io/cloud-builders/git'
+    id: push-cadence-tag
+    entrypoint: 'bash'
+    secretEnv: ['GITHUB_TOKEN']
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        git clone --quiet https://github.com/GoogleCloudPlatform/application-integration-management-toolkit.git repo
+        cd repo
+        git config user.email "appintegration-bot@google.com"
+        git config user.name "AppInt Release Bot"
+        git remote set-url origin "https://$$GITHUB_TOKEN@github.com/GoogleCloudPlatform/application-integration-management-toolkit.git"
+        git fetch --tags --quiet
+        # Base = latest REAL release tag (clean vX.Y.Z); ignore prior "-moss" cadence tags so
+        # the version never drifts and the parser can't choke on a pre-release suffix.
+        BASE=$$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -n 1 || true)
+        if [ -z "$${BASE}" ]; then echo "ERROR: no vX.Y.Z release tag found; aborting."; exit 1; fi
+        NEW_TAG="$${BASE}-moss.$$(date -u +%Y%m%d%H%M%S)"
+        echo "Cadence rebuild: base=$${BASE} -> tag=$${NEW_TAG}"
+        git tag "$${NEW_TAG}"
+        git push origin "$${NEW_TAG}"
+        echo "Pushed $${NEW_TAG}; the us-west1 container pipeline will rebuild, rescan and republish."
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/github-tag-pusher-token/versions/latest
+      env: 'GITHUB_TOKEN'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 600s
